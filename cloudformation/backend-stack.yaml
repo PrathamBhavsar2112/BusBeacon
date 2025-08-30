@@ -1,0 +1,812 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Backend stack for BusBeacon - Lambda, API Gateway, SNS (Updated 2025-06-29-v17)
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !ImportValue BusesTableArn
+                  - !ImportValue RoutesTableArn
+                  - !ImportValue UserSubscriptionsTableArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                Resource: !Ref BusBeaconAlertsTopic
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:AdminGetUser
+                  - cognito-identity:GetCredentialsForIdentity
+                  - cognito-identity:GetId
+                Resource: '*'
+        - PolicyName: LocationServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - geo:GetMapStyleDescriptor
+                  - geo:GetMapTile
+                Resource: !Sub arn:aws:geo:${AWS::Region}:${AWS::AccountId}:map/BusBeaconMap
+
+  FetchBusesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchBusesHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from decimal import Decimal
+
+          def decimal_to_json(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj) if obj % 1 else int(obj)
+              raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+          def lambda_handler(event, context):
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('Buses')
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(items, default=decimal_to_json),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                      }
+                  }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  GetRouteLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetRouteHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from decimal import Decimal
+
+          def decimal_to_json(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj) if obj % 1 else int(obj)
+              raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+          def lambda_handler(event, context):
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  buses_table = dynamodb.Table('Buses')
+                  routes_table = dynamodb.Table('Routes')
+                  bus_id = event.get('queryStringParameters', {}).get('bus_id', '')
+                  if not bus_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing bus_id parameter'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                          }
+                      }
+                  bus_response = buses_table.get_item(Key={'bus_id': bus_id})
+                  bus = bus_response.get('Item', {})
+                  route_id = bus.get('route', '')
+                  if not route_id:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Bus not found or no route associated'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  response = routes_table.get_item(Key={'route_id': route_id})
+                  item = response.get('Item', {})
+                  if not item:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Route not found'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(item, default=decimal_to_json),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                      }
+                  }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  SimulateMovementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SimulateMovementHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+          from datetime import datetime
+          from decimal import Decimal
+          import math
+          import logging
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          def haversine(lat1, lon1, lat2, lon2):
+              R = 6371
+              lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+              dlat = lat2 - lat1
+              dlon = lon2 - lon1
+              a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+              c = 2 * math.asin(math.sqrt(a))
+              return R * c
+
+          def lambda_handler(event, context):
+              try:
+                  # Check if updates are enabled via environment variable
+                  if os.environ.get('ENABLE_UPDATES', 'false').lower() != 'true':
+                      logger.info("Updates disabled. No position changes made.")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Updates disabled, no changes made'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'POST',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                          }
+                      }
+
+                  dynamodb = boto3.resource('dynamodb')
+                  sns = boto3.client('sns')
+                  buses_table = dynamodb.Table('Buses')
+                  routes_table = dynamodb.Table('Routes')
+                  subscriptions_table = dynamodb.Table('UserSubscriptions')
+
+                  # Fetch all buses and subscriptions
+                  buses_response = buses_table.scan()
+                  buses = buses_response.get('Items', [])
+                  subs_response = subscriptions_table.scan()
+                  subscriptions = subs_response.get('Items', [])
+
+                  for bus in buses:
+                      bus_id = bus['bus_id']
+                      current_lat = float(bus['lat']) if isinstance(bus['lat'], Decimal) else float(bus['lat'])
+                      current_lng = float(bus['lng']) if isinstance(bus['lng'], Decimal) else float(bus['lng'])
+                      route_id = bus.get('route', '1')  # Default to route 1 if not specified
+
+                      # Fetch route to get stop sequence
+                      route_response = routes_table.get_item(Key={'route_id': route_id})
+                      route = route_response.get('Item', {})
+                      if not route or 'stops' not in route:
+                          logger.warning(f"No valid route or stops found for route_id: {route_id}")
+                          continue
+
+                      stops = route['stops']
+                      if not stops:
+                          logger.warning(f"No stops defined for route_id: {route_id}")
+                          continue
+
+                      # Determine current stop index (simplified: assume last position matches a stop)
+                      current_stop_index = 0
+                      min_distance = float('inf')
+                      for i, stop in enumerate(stops):
+                          stop_lat = float(stop.get('lat', 0))
+                          stop_lng = float(stop.get('lng', 0))
+                          distance = haversine(current_lat, current_lng, stop_lat, stop_lng)
+                          if distance < min_distance:
+                              min_distance = distance
+                              current_stop_index = i
+
+                      # Move to next stop (loop back if at end)
+                      next_stop_index = (current_stop_index + 1) % len(stops)
+                      next_stop = stops[next_stop_index]
+                      next_lat = float(next_stop.get('lat', current_lat))
+                      next_lng = float(next_stop.get('lng', current_lng))
+
+                      # Update bus position
+                      bus['lat'] = Decimal(str(next_lat))
+                      bus['lng'] = Decimal(str(next_lng))
+                      bus['last_updated'] = datetime.utcnow().isoformat() + 'Z'
+                      for key, value in bus.items():
+                          if isinstance(value, Decimal):
+                              bus[key] = Decimal(str(float(value)))
+                      buses_table.put_item(Item=bus)
+                      logger.info(f"Updated bus {bus_id} to next stop: {next_stop.get('name', 'Unknown')}")
+
+                      # Check proximity for all subscriptions
+                      for sub in subscriptions:
+                          user_lat = float(sub.get('lat', 0))
+                          user_lon = float(sub.get('lon', 0))
+                          distance = haversine(next_lat, next_lng, user_lat, user_lon)
+                          if distance <= 1:
+                              sns.publish(
+                                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                                  Message=f"Bus {bus_id} is {round(distance, 2)} km from your location!",
+                                  MessageAttributes={
+                                      'email': {
+                                          'DataType': 'String',
+                                          'StringValue': sub.get('email', '')
+                                      }
+                                  }
+                              )
+                              logger.info(f"Proximity alert sent for bus {bus_id} to {sub.get('email', 'unknown')}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': f'Updated {len(buses)} bus positions to next stops'}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'POST',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                      }
+                  }
+              except ClientError as e:
+                  logger.error(f"Database error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)} with event: {json.dumps(event)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Unexpected error: {str(e)}'}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BusBeaconAlertsTopic
+      Timeout: 30
+
+  FindNearestStopLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FindNearestStopHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from decimal import Decimal
+          import math
+          import logging
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          def haversine(lat1, lon1, lat2, lon2):
+              R = 6371
+              lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+              dlat = lat2 - lat1
+              dlon = lon2 - lon1
+              a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+              c = 2 * math.asin(math.sqrt(a))
+              return R * c
+
+          def decimal_to_json(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj) if obj % 1 else int(obj)
+              raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+          def lambda_handler(event, context):
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  buses_table = dynamodb.Table('Buses')
+                  routes_table = dynamodb.Table('Routes')
+                  user_lat = float(event.get('queryStringParameters', {}).get('lat', 0))
+                  user_lon = float(event.get('queryStringParameters', {}).get('lon', 0))
+                  bus_id = event.get('queryStringParameters', {}).get('bus_id')
+
+                  if not user_lat or not user_lon:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing lat or lon parameters'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                          }
+                      }
+
+                  # Determine route_id based on the selected bus, fallback to '1' if no bus_id or bus not found
+                  route_id = '1'  # Default route
+                  if bus_id:
+                      bus_response = buses_table.get_item(Key={'bus_id': bus_id})
+                      bus = bus_response.get('Item', {})
+                      if bus and 'route' in bus:
+                          route_id = bus['route']
+                      else:
+                          logger.warning(f"No bus found or no route for bus_id: {bus_id}")
+
+                  response = routes_table.get_item(Key={'route_id': route_id})
+                  route = response.get('Item', {})
+                  if not route:
+                      logger.error(f"Route not found for route_id: {route_id}")
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Route not found'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  stops = route.get('stops', [])
+                  if not stops:
+                      logger.error(f"No stops found for route_id: {route_id}")
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'No stops found'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  nearest_stop = None
+                  min_distance = float('inf')
+                  for stop in stops:
+                      try:
+                          stop_lat = float(stop.get('lat', 0))
+                          stop_lon = float(stop.get('lng', 0))
+                          distance = haversine(user_lat, user_lon, stop_lat, stop_lon)
+                          if distance < min_distance:
+                              min_distance = distance
+                              nearest_stop = stop
+                      except (KeyError, ValueError) as e:
+                          logger.error(f"Invalid stop data: {str(e)}")
+                  if not nearest_stop:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'No valid stops found'}),
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          }
+                      }
+                  walking_time_minutes = (min_distance / 5) * 60
+                  result = {
+                      'stop_name': nearest_stop.get('name', 'Unknown Stop'),
+                      'lat': nearest_stop.get('lat', 0),
+                      'lng': nearest_stop.get('lng', 0),
+                      'distance_km': round(min_distance, 3),
+                      'walking_time_minutes': round(walking_time_minutes, 1)
+                  }
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(result, default=decimal_to_json),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                      }
+                  }
+              except ClientError as e:
+                  logger.error(f"Database error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)} with event: {json.dumps(event)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Unexpected error: {str(e)}'}),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  PostAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PostAuthHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from decimal import Decimal
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  sns = boto3.client('sns')
+                  user_subscriptions_table = dynamodb.Table('UserSubscriptions')
+                  user_id = event['request']['userAttributes']['sub']
+                  email = event['request']['userAttributes']['email']
+
+                  # Check if user is already subscribed
+                  response = user_subscriptions_table.get_item(Key={'user_id': user_id})
+                  if 'Item' not in response:
+                      user_subscriptions_table.put_item(
+                          Item={
+                              'user_id': user_id,
+                              'email': email,
+                              'lat': Decimal('44.65'),
+                              'lon': Decimal('-63.58')
+                          }
+                      )
+                      sns.subscribe(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Protocol='email',
+                          Endpoint=email
+                      )
+                  return event
+              except ClientError as e:
+                  print(f"Error: {str(e)}")
+                  return event
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return event
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BusBeaconAlertsTopic
+      Timeout: 30
+
+  BusBeaconAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: BusBeaconAlerts
+
+  LambdaCognitoPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostAuthLambda
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !ImportValue UserPoolArn
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: BusBeaconApi
+      Description: API for BusBeacon (Updated 2025-06-28)
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: BusBeaconCognitoAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !ImportValue UserPoolArn
+
+  BusesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: buses
+
+  BusesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BusesResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FetchBusesLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  BusesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BusesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  RouteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: route
+
+  RouteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RouteResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetRouteLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  RouteOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RouteResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  NearestStopResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: nearest-stop
+
+  NearestStopMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref NearestStopResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FindNearestStopLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  NearestStopOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref NearestStopResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - BusesMethod
+      - BusesOptionsMethod
+      - RouteMethod
+      - RouteOptionsMethod
+      - NearestStopMethod
+      - NearestStopOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+      Description: Deployment-$(!Sub '${AWS::StackName}-$(!Timestamp)-v10')
+
+  LambdaApiGatewayPermissionBuses:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchBusesLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/buses
+
+  LambdaApiGatewayPermissionRoute:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetRouteLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/route
+
+  LambdaApiGatewayPermissionNearestStop:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FindNearestStopLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/nearest-stop
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: ApiGatewayUrl
+  FetchBusesLambdaArn:
+    Value: !GetAtt FetchBusesLambda.Arn
+    Export:
+      Name: FetchBusesLambdaArn
+  GetRouteLambdaArn:
+    Value: !GetAtt GetRouteLambda.Arn
+    Export:
+      Name: GetRouteLambdaArn
+  SimulateMovementLambdaArn:
+    Value: !GetAtt SimulateMovementLambda.Arn
+    Export:
+      Name: SimulateMovementLambdaArn
+  NearestStopLambdaArn:
+    Value: !GetAtt FindNearestStopLambda.Arn
+    Export:
+      Name: NearestStopLambdaArn
+  PostAuthLambdaArn:
+    Value: !GetAtt PostAuthLambda.Arn
+    Export:
+      Name: PostAuthLambdaArn

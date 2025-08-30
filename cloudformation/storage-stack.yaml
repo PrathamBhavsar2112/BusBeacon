@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Storage stack for BusBeacon - DynamoDB, S3, and CloudFront
+
+Resources:
+  BusesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Buses
+      AttributeDefinitions:
+        - AttributeName: bus_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: bus_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  RoutesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Routes
+      AttributeDefinitions:
+        - AttributeName: route_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: route_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  UserSubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserSubscriptions
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub busbeacon-website-${AWS::AccountId}-${AWS::Region}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}"
+            Action: 's3:GetObject'
+            Resource: !Sub ${WebsiteBucket.Arn}/*
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${WebsiteBucket}"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100  # Use U.S., Canada, Europe (adjust based on needs)
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  DataInitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt BusesTable.Arn
+                  - !GetAtt RoutesTable.Arn
+                  - !GetAtt UserSubscriptionsTable.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  DataInitializerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DataInitializerHandler
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from decimal import Decimal
+          import cfnresponse
+          import time
+
+          def wait_for_table(table_name):
+              dynamodb = boto3.client('dynamodb')
+              max_attempts = 10
+              for _ in range(max_attempts):
+                  try:
+                      dynamodb.describe_table(TableName=table_name)
+                      return True
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                          time.sleep(5)
+                      else:
+                          raise e
+              return False
+
+          def lambda_handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  dynamodb = boto3.resource('dynamodb')
+
+                  for table_name in ['Buses', 'Routes']:
+                      if not wait_for_table(table_name):
+                          raise Exception(f"Table {table_name} not ready")
+
+                  buses_table = dynamodb.Table('Buses')
+                  routes_table = dynamodb.Table('Routes')
+
+                  if request_type == 'Create' or request_type == 'Update':
+                      buses = [
+                          {
+                              'bus_id': 'Bus_101',
+                              'lat': Decimal('44.6502'),
+                              'lng': Decimal('-63.5793'),
+                              'route': 'Blue Line',
+                              'last_updated': '2025-06-16T00:00:00Z'
+                          },
+                          {
+                              'bus_id': 'Bus_102',
+                              'lat': Decimal('44.6520'),
+                              'lng': Decimal('-63.5820'),
+                              'route': 'Blue Line',
+                              'last_updated': '2025-06-16T00:00:00Z'
+                          },
+                          {
+                              'bus_id': 'Bus_103',
+                              'lat': Decimal('44.6488'),
+                              'lng': Decimal('-63.5752'),
+                              'route': 'Blue Line',
+                              'last_updated': '2025-06-16T00:00:00Z'
+                          }
+                      ]
+                      for bus in buses:
+                          buses_table.put_item(Item=bus)
+
+                      route = {
+                          'route_id': 'blue-line',
+                          'route_name': 'Blue Line',
+                          'stops': [
+                              {'stop_name': 'Spring Garden', 'lat': Decimal('44.6462'), 'lng': Decimal('-63.5740')},
+                              {'stop_name': 'Barrington', 'lat': Decimal('44.6488'), 'lng': Decimal('-63.5752')},
+                              {'stop_name': 'Terminal', 'lat': Decimal('44.6520'), 'lng': Decimal('-63.5820')}
+                          ],
+                          'color': '#007bff'
+                      }
+                      routes_table.put_item(Item=route)
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  elif request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': 'Invalid request type'})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Role: !GetAtt DataInitializerRole.Arn
+      Timeout: 30
+
+  DataInitializerCustomResource:
+    Type: Custom::DataInitializer
+    DependsOn:
+      - BusesTable
+      - RoutesTable
+      - UserSubscriptionsTable
+    Properties:
+      ServiceToken: !GetAtt DataInitializerLambda.Arn
+
+Outputs:
+  BusesTableArn:
+    Value: !GetAtt BusesTable.Arn
+    Export:
+      Name: BusesTableArn
+  RoutesTableArn:
+    Value: !GetAtt RoutesTable.Arn
+    Export:
+      Name: RoutesTableArn
+  UserSubscriptionsTableArn:
+    Value: !GetAtt UserSubscriptionsTable.Arn
+    Export:
+      Name: UserSubscriptionsTableArn
+  WebsiteBucketName:
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: WebsiteBucketName
+  CloudFrontDistributionDomain:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: CloudFrontDistributionDomain

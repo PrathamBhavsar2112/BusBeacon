@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Auth and Map stack for BusBeacon - Cognito and Location Service (Updated 2025-06-27-v2)
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: BusBeaconUserPool
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          RequireLowercase: true
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+      LambdaConfig:
+        PostAuthentication: !ImportValue PostAuthLambdaArn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: BusBeaconWebClient
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: BusBeaconIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthRole.Arn
+
+  AuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              ForAnyValue:StringLike:
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: LocationServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - geo:GetMapStyleDescriptor
+                  - geo:GetMapTile
+                Resource: !Sub arn:aws:geo:${AWS::Region}:${AWS::AccountId}:map/BusBeaconMap
+
+  MapResource:
+    Type: AWS::Location::Map
+    Properties:
+      MapName: BusBeaconMap
+      Configuration:
+        Style: VectorEsriStreets
+      PricingPlan: RequestBasedUsage
+      Description: Map for BusBeacon tracking
+
+  LambdaCognitoPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: UserPool
+    Properties:
+      FunctionName: !ImportValue PostAuthLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: UserPoolId
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: UserPoolClientId
+  MapName:
+    Value: !Ref MapResource
+    Export:
+      Name: MapName
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: UserPoolArn
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+    Export:
+      Name: IdentityPoolId
