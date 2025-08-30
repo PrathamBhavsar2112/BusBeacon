@@ -1,0 +1,15 @@
+{
+  "dev": {
+    "awscloudformation": {
+      "AuthRoleName": "amplify-busbeacon-dev-deb79-authRole",
+      "UnauthRoleArn": "arn:aws:iam::662855374638:role/amplify-busbeacon-dev-deb79-unauthRole",
+      "AuthRoleArn": "arn:aws:iam::662855374638:role/amplify-busbeacon-dev-deb79-authRole",
+      "Region": "us-east-1",
+      "DeploymentBucketName": "amplify-busbeacon-dev-deb79-deployment",
+      "UnauthRoleName": "amplify-busbeacon-dev-deb79-unauthRole",
+      "StackName": "amplify-busbeacon-dev-deb79",
+      "StackId": "arn:aws:cloudformation:us-east-1:662855374638:stack/amplify-busbeacon-dev-deb79/8e0c4590-5075-11f0-aa12-0affda18436f",
+      "AmplifyAppId": "d13uh4j0h6lbtw"
+    }
+  }
+}
